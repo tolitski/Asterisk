@@ -1,0 +1,90 @@
+--- app_rpt.c.stock	2016-04-13 09:13:53.000000000 -0400
++++ app_rpt.c.events	2016-04-13 09:18:22.000000000 -0400
+@@ -1356,6 +1356,7 @@
+ static int channel_revert(struct rpt *myrpt);
+ static int channel_steer(struct rpt *myrpt, char *data);
+ static void rpt_telemetry(struct rpt *myrpt,int mode, void *data);
++static void rpt_manager_trigger(struct rpt *myrpt, char *event, char *value);
+ 
+ AST_MUTEX_DEFINE_STATIC(nodeloglock);
+ 
+@@ -4583,6 +4584,8 @@
+ 	struct flock fl;
+ 	time_t	t;
+ 
++	rpt_manager_trigger(myrpt, "MDC-1200", data);
++
+ 	if (!fromnode)
+ 	{
+ 		ast_verbose("Got MDC-1200 data %s from local system (%s)\n",
+@@ -5375,6 +5378,7 @@
+ 	buf[1] = 0;
+ 	if (newval > 0) buf[0] = '1';
+ 	pbx_builtin_setvar_helper(myrpt->rxchannel, varname, buf);
++	rpt_manager_trigger(myrpt, varname, buf);
+ 	if (newval >= 0) rpt_event_process(myrpt);
+ 	return;
+ }
+@@ -5392,8 +5396,10 @@
+ 	if (n) snprintf(obuf,sizeof(obuf) - 1,"%d,%s",n,buf);
+ 	else strcpy(obuf,"0");
+ 	pbx_builtin_setvar_helper(myrpt->rxchannel,"RPT_ALINKS",obuf);
++	rpt_manager_trigger(myrpt, "RPT_ALINKS", obuf);
+ 	snprintf(obuf,sizeof(obuf) - 1,"%d",n);
+ 	pbx_builtin_setvar_helper(myrpt->rxchannel,"RPT_NUMALINKS",obuf);
++	rpt_manager_trigger(myrpt, "RPT_NUMALINKS", obuf);
+ 	ast_mutex_lock(&myrpt->lock);
+ 	__mklinklist(myrpt,NULL,buf,0);
+ 	ast_mutex_unlock(&myrpt->lock);
+@@ -5402,8 +5408,10 @@
+ 	if (n) snprintf(obuf,sizeof(obuf) - 1,"%d,%s",n,buf);
+ 	else strcpy(obuf,"0");
+ 	pbx_builtin_setvar_helper(myrpt->rxchannel,"RPT_LINKS",obuf);
++	rpt_manager_trigger(myrpt, "RPT_LINKS", obuf);
+ 	snprintf(obuf,sizeof(obuf) - 1,"%d",n);
+ 	pbx_builtin_setvar_helper(myrpt->rxchannel,"RPT_NUMLINKS",obuf);
++	rpt_manager_trigger(myrpt, "RPT_NUMLINKS", obuf);
+ 	rpt_event_process(myrpt);
+ 	return;
+ }
+@@ -18502,10 +18510,14 @@
+ {
+ int	res;
+ pthread_attr_t	attr;
+-char	cmd[MAXDTMF+1] = "",c;
++char	cmd[MAXDTMF+1] = "",c,tone[10];
+ 
+ 
+ 	c = c_in & 0x7f;
++
++	sprintf(tone,"%c",c);
++	rpt_manager_trigger(myrpt, "DTMF", tone);
++
+ 	if (myrpt->p.archivedir)
+ 	{
+ 		char str[100];
+@@ -24087,10 +24099,24 @@
+ 	return res;
+ }
+ 
++static void rpt_manager_trigger(struct rpt *myrpt, char *event, char *value)
++{
++	manager_event(EVENT_FLAG_CALL, event,
++		"Node: %s\r\n"
++		"Channel: %s\r\n"
++		"EventValue: %s\r\n"
++		"LastKeyedTime: %s\r\n"
++		"LastTxKeyedTime: %s\r\n",
++                myrpt->name, myrpt->rxchannel->name, value,
++                ctime(&myrpt->lastkeyedtime), ctime(&myrpt->lasttxkeyedtime)
++        );
++}
++
+ #ifndef OLD_ASTERISK
+ /*!\brief callback to display list of locally configured nodes
+    \addtogroup Group_AMI
+  */
++
+ static int manager_rpt_local_nodes(struct mansession *s, const struct message *m)
+ {
+     int i;
