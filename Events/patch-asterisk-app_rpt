@@ -1,5 +1,5 @@
---- app_rpt.c.stock	2016-04-13 09:13:53.000000000 -0400
-+++ app_rpt.c.events	2016-04-13 09:18:22.000000000 -0400
+--- app_rpt.c	2016-04-13 09:13:53.000000000 -0400
++++ app_rpt.c	2016-04-13 09:18:22.000000000 -0400
 @@ -1356,6 +1356,7 @@
  static int channel_revert(struct rpt *myrpt);
  static int channel_steer(struct rpt *myrpt, char *data);
