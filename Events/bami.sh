@@ -1,7 +1,7 @@
 #!/bin/bash
 
 user=admin
-pass=lsmft1234a
+pass=secret_password_here
 log=log.log
 
 # Generic function for logging
