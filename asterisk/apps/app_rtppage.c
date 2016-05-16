@@ -20,7 +20,9 @@
  * at the top of the source tree.
  */
 
-/*RTPPage - An asterisk module by Netconf
+/*
+
+RTPPage - An asterisk module by Netconf
 
 What is it for
 app_rtppage is an asterisk app that provides the functionality to rtp stream voice data from an asterisk server
