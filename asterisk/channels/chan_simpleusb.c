@@ -49,12 +49,30 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 535 $")
 #include <errno.h>
 #include <usb.h>
 #include <search.h>
+#include <dirent.h>
+#include <libgen.h>
 #include <alsa/asoundlib.h>
 #include <linux/ppdev.h>
 #include <linux/parport.h>
 #include <linux/version.h>
+#include <sys/mman.h>
 
 #include "pocsag.c"
+
+// Raspi bit shifting stuff for the GPIO
+#define GPIO_BASE		0x20200000
+#define GPIO_BASE_2             0x3f200000
+#define PAGE_SIZE (4*1024)
+#define BLOCK_SIZE (4*1024)
+
+#define INP_GPIO(g) *(o->gpiopi+((g)/10)) &= ~(7<<(((g)%10)*3))
+#define OUT_GPIO(g) *(o->gpiopi+((g)/10)) |=  (1<<(((g)%10)*3))
+ 
+#define GPIO_SET *(o->gpiopi+7)  // sets   bits which are 1 ignores bits which are 0
+#define GPIO_CLR *(o->gpiopi+10) // clears bits which are 1 ignores bits which are 0
+ 
+#define GPIO_READ(g) (*(o->gpiopi+13)&(1<<g)) // 0 if LOW, (1<<g) if HIGH
+
 
 #define DEBUG_CAPTURES	 		1
 
@@ -69,8 +87,6 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 535 $")
 #define	MIXER_PARAM_MIC_BOOST "Auto Gain Control"
 #define	MIXER_PARAM_SPKR_PLAYBACK_SW "Speaker Playback Switch"
 #define	MIXER_PARAM_SPKR_PLAYBACK_VOL "Speaker Playback Volume"
-#define	MIXER_PARAM_SPKR_PLAYBACK_SW_NEW "Headphone Playback Switch"
-#define	MIXER_PARAM_SPKR_PLAYBACK_VOL_NEW "Headphone Playback Volume"
 
 #define	DELIMCHR ','
 #define	QUOTECHR 34
@@ -133,6 +149,8 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 535 $")
 #define C119_PRODUCT_ID  	0x0008
 #define C119A_PRODUCT_ID  	0x013a
 #define C108_HID_INTERFACE	3
+#define JMTEK_VENDOR_ID		0x0c76
+#define JMTEK_PRODUCT_ID	0x1529
 
 #define HID_REPORT_GET		0x01
 #define HID_REPORT_SET		0x09
@@ -212,11 +230,15 @@ START_CONFIG
 
         ; duplex = 1		; duplex mode    
 
-	; duplex3 = 0		; duplex 3 gain setting (0 to disable)
-
 	; rxondelay = 0		  ; number of 20ms intervals to hold off receiver turn-on indication
 
         ; eeprom = no		; no eeprom installed
+
+	;piversion2=1                    ; set to 1 for a Raspi B2, 0 for all others
+	;israspi=1                       ; set to 1 when its a pi, leave at 0 for others
+	;pttpin=23                       ; Transmitter pin
+	;corpin=22                       ; Carrier RX pin
+	;ctcsspin=17                     ; CTCSS RX pin
 
     ;------------------------------ JITTER BUFFER CONFIGURATION --------------------------
     ; jbenable = yes              ; Enables the use of a jitterbuffer on the receiving side of an
@@ -371,8 +393,8 @@ pthread_t pulserid;
 
 static int simpleusb_debug;
 
-enum {CD_IGNORE,CD_HID,CD_HID_INVERT,CD_PP,CD_PP_INVERT};
-enum {SD_IGNORE,SD_HID,SD_HID_INVERT,SD_PP,SD_PP_INVERT};    				 // no,external,externalinvert,software
+enum {CD_IGNORE,CD_HID,CD_HID_INVERT,CD_PP,CD_PP_INVERT,CD_RPI,CD_RPI_INVERT};
+enum {SD_IGNORE,SD_HID,SD_HID_INVERT,SD_PP,SD_PP_INVERT,SD_RPI,SD_RPI_INVERT};    				 // no,external,externalinvert,software
 enum {PAGER_NONE,PAGER_A,PAGER_B};
 
 /*	DECLARE STRUCTURES */
@@ -470,7 +492,6 @@ struct chan_simpleusb_pvt {
 	char devstr[128];
 	int spkrmax;
 	int micmax;
-	int micplaymax;
 
 #ifndef	NEW_ASTERISK
 	pthread_t sthread;
@@ -527,6 +548,21 @@ struct chan_simpleusb_pvt {
 	char txkeyed;				// tx key request from upper layers 
 	char txtestkey;
 	char txclikey;
+//Added for Raspberry Pi
+	int	pttpin;
+	int	corpin;
+	int	ctcsspin;
+	char rxgpiosq;
+	char rxgpioctcss;
+
+	char	piversion2;
+	char	israspi;
+
+	int serdev;
+	int mem_fd;
+    	void *gpio_map;
+ 	volatile unsigned *gpiopi;
+//End additions
 
 	time_t lasthidtime;
 	struct ast_dsp *dsp;
@@ -538,7 +574,6 @@ struct chan_simpleusb_pvt {
 	float	hpy[NTAPS_PL + 1];
 
 	int32_t	destate;
-	int32_t	prestate;
 
 	char    rxcpusaver;
 	char    txcpusaver;
@@ -587,8 +622,6 @@ struct chan_simpleusb_pvt {
 	int8_t		last_pp_in;
 	char		had_pp_in;
 
-	char	newname;
-
 	struct {
 	    unsigned rxcapraw:1;
 	    unsigned txcapraw:1;
@@ -610,8 +643,6 @@ struct chan_simpleusb_pvt {
 	int16_t apeak;
 	int plfilter;
 	int deemphasis;
-	int preemphasis;
-	int duplex3;
 	int32_t cur_gpios;
 	char *gpios[32];
 	char *pps[32];
@@ -637,6 +668,12 @@ static struct chan_simpleusb_pvt simpleusb_default = {
 	.usedtmf = 1,
 	.rxondelay = 0,
 	.pager = PAGER_NONE,
+	/* GPIO stuff */
+	.pttpin = 27,
+	.corpin = 22,
+	.israspi=0,
+	.piversion2=1
+
 };
 
 /*	DECLARE FUNCTION PROTOTYPES	*/
@@ -644,6 +681,12 @@ static struct chan_simpleusb_pvt simpleusb_default = {
 static int	hidhdwconfig(struct chan_simpleusb_pvt *o);
 static void mixer_write(struct chan_simpleusb_pvt *o);
 static void tune_write(struct chan_simpleusb_pvt *o);
+static int gpio_init(struct chan_simpleusb_pvt *o); 
+static void gpio_uninit(struct chan_simpleusb_pvt *o);
+static int gpio_getcor(struct chan_simpleusb_pvt *o);
+static int gpio_getctcss(struct chan_simpleusb_pvt *o);
+static int gpio_pttkey(struct chan_simpleusb_pvt *o);
+static int gpio_pttunkey(struct chan_simpleusb_pvt *o);
 
 static char *simpleusb_active;	 /* the active device */
 
@@ -742,24 +785,6 @@ int32_t accum; /* 32 bit accumulator */
         accum = (*state * coeff00);
         /* adjust gain so that we have unity @ 1KHz */
         return((accum >> 14) + (accum >> 15));
-}
-
-/* Perform standard 6db/octave pre-emphasis */
-static int16_t preemph(int16_t input,int32_t *state)
-{
-
-int16_t coeff00 = 17610;
-int16_t coeff01 = -17610;
-int16_t adjval = 13404;
-int32_t y,temp0,temp1; 
-
-	temp0 =	*state * coeff01;
-	*state = input;
-	temp1 = input * coeff00;
-	y = (temp0 + temp1) / adjval;
-	if (y > 32767) y=32767;
-	else if (y <-32767) y=-32767;
-	return(y);
 }
 
 
@@ -993,13 +1018,14 @@ static struct usb_device *hid_device_init(char *desired_device)
         for (dev = usb_bus->devices;
              dev;
              dev = dev->next) {
-            if ((dev->descriptor.idVendor
+            if (((dev->descriptor.idVendor
                   == C108_VENDOR_ID) &&
 		(((dev->descriptor.idProduct & 0xfffc) == C108_PRODUCT_ID) ||
 		(dev->descriptor.idProduct == C108AH_PRODUCT_ID) ||
 		(dev->descriptor.idProduct == C119A_PRODUCT_ID) ||
 		((dev->descriptor.idProduct & 0xff00)  == N1KDO_PRODUCT_ID) ||
-		(dev->descriptor.idProduct == C119_PRODUCT_ID)))
+		(dev->descriptor.idProduct == C119_PRODUCT_ID))) ||
+		(dev->descriptor.idVendor == JMTEK_VENDOR_ID && dev->descriptor.idProduct == JMTEK_PRODUCT_ID))
 		{
                         sprintf(devstr,"%s/%s", usb_bus->dirname,dev->filename);
 			for(i = 0; i < 32; i++)
@@ -1017,7 +1043,7 @@ static struct usb_device *hid_device_init(char *desired_device)
 			        	desdev[strlen(desdev) -1 ] = 0;
 				if (strcasecmp(desdev,devstr)) continue;
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,20)) && !defined(AST_BUILDOPT_LIMEY)
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,20))
 				sprintf(str,"/sys/class/sound/card%d/device",i);
 				memset(desdev,0,sizeof(desdev));
 				if (readlink(str,desdev,sizeof(desdev) - 1) == -1) continue;
@@ -1077,13 +1103,14 @@ static int hid_device_mklist(void)
         for (dev = usb_bus->devices;
              dev;
              dev = dev->next) {
-            if ((dev->descriptor.idVendor
+            if (((dev->descriptor.idVendor
                   == C108_VENDOR_ID) &&
 		(((dev->descriptor.idProduct & 0xfffc) == C108_PRODUCT_ID) ||
 		(dev->descriptor.idProduct == C108AH_PRODUCT_ID) ||
 		(dev->descriptor.idProduct == C119A_PRODUCT_ID) ||
 		((dev->descriptor.idProduct & 0xff00)  == N1KDO_PRODUCT_ID) ||
-		(dev->descriptor.idProduct == C119_PRODUCT_ID)))
+		(dev->descriptor.idProduct == C119_PRODUCT_ID))) ||
+		(dev->descriptor.idVendor == JMTEK_VENDOR_ID && dev->descriptor.idProduct == JMTEK_PRODUCT_ID))
 		{
                         sprintf(devstr,"%s/%s", usb_bus->dirname,dev->filename);
 			for(i = 0;i < 32; i++)
@@ -1100,7 +1127,7 @@ static int hid_device_mklist(void)
 				if (desdev[strlen(desdev) - 1] == '\n')
 			        	desdev[strlen(desdev) -1 ] = 0;
 				if (strcasecmp(desdev,devstr)) continue;
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,20)) && !defined(AST_BUILDOPT_LIMEY)
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,20))
 				sprintf(str,"/sys/class/sound/card%d/device",i);
 				memset(desdev,0,sizeof(desdev));
 				if (readlink(str,desdev,sizeof(desdev) - 1) == -1) continue;
@@ -1161,7 +1188,7 @@ char	str[200],desdev[200],*cp;
 
 	for(i = 0;i < 32; i++)
 	{
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,20)) && !defined(AST_BUILDOPT_LIMEY)
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,20))
 		sprintf(str,"/sys/class/sound/card%d/device",i);
 		memset(desdev,0,sizeof(desdev));
 		if (readlink(str,desdev,sizeof(desdev) - 1) == -1) continue;
@@ -1417,12 +1444,66 @@ int	i,j,k;
 	pthread_exit(0);
 }
 
+static int gpio_init(struct chan_simpleusb_pvt *o)
+{
+
+
+
+int gpio_b;
+	
+	if (o->piversion2) 
+		gpio_b = GPIO_BASE_2;
+	else
+		gpio_b = GPIO_BASE;
+
+
+
+   // Open /dev/mem
+   if ((o->mem_fd = open("/dev/mem", O_RDWR|O_SYNC) ) < 0) {
+      printf("Failed to open /dev/mem, try checking permissions.\n");
+      return -1;
+   }
+ 
+   o->gpio_map = mmap(
+      NULL,
+      BLOCK_SIZE,
+      PROT_READ|PROT_WRITE,
+      MAP_SHARED,
+      o->mem_fd,      // File descriptor to physical memory virtual file '/dev/mem'
+      gpio_b       // Address in physical map that we want this memory block to expose
+   );
+ 
+   if (o->gpio_map == MAP_FAILED) {
+        perror("mmap");
+        return -1;
+   }
+ 
+   o->gpiopi = (volatile unsigned *)o->gpio_map;
+	ast_log(LOG_NOTICE, "GPIO's Initialisation started \n");
+	
+
+	if(o->corpin) INP_GPIO(o->corpin);
+	if(o->ctcsspin) INP_GPIO(o->ctcsspin);
+	INP_GPIO(o->pttpin);
+	OUT_GPIO(o->pttpin);
+	ast_log(LOG_NOTICE, "GPIO's Initialised PTT Pin %i, COR Pin %i, CTCSS pin %i\n",o->pttpin,o->corpin,o->ctcsspin);
+//	%c is hex, %i is what I can read, %x is hex we can read	
+	GPIO_CLR = 1 << o->pttpin;
+   return 0;
+
+}
+
+
+
+
+
+
 /*
 */
 static void *hidthread(void *arg)
 {
 	unsigned char buf[4],bufsave[4],keyed,ctcssed,txreq;
-	char fname[200], *s, isn1kdo, lasttxtmp;
+	char lastrx, fname[200], *s, isn1kdo, lasttxtmp;
 	int i,j,k,res;
 	struct usb_device *usb_dev;
 	struct usb_dev_handle *usb_handle;
@@ -1551,12 +1632,6 @@ static void *hidthread(void *arg)
 		ast_mutex_unlock(&usb_dev_lock);
 		o->micmax = amixer_max(o->devicenum,MIXER_PARAM_MIC_CAPTURE_VOL);
 		o->spkrmax = amixer_max(o->devicenum,MIXER_PARAM_SPKR_PLAYBACK_VOL);
-		o->micplaymax = amixer_max(o->devicenum,MIXER_PARAM_MIC_PLAYBACK_VOL);
-		if (o->spkrmax == -1) 
-		{
-			o->newname = 1;
-			o->spkrmax = amixer_max(o->devicenum,MIXER_PARAM_SPKR_PLAYBACK_VOL_NEW);
-		}
 
 		usb_dev = hid_device_init(o->devstr);
 		if (usb_dev == NULL) {
@@ -1598,6 +1673,7 @@ static void *hidthread(void *arg)
 		else
 			o->devtype = usb_dev->descriptor.idProduct;
 		traceusb1(("hidthread: Starting normally on %s!!\n",o->name));
+		lastrx = 0;
                 if (option_verbose > 1)
                        ast_verbose(VERBOSE_PREFIX_2 "Set device %s to %s\n",o->devstr,o->name);
 		mixer_write(o);
@@ -1629,7 +1705,6 @@ static void *hidthread(void *arg)
 		if (o->wanteeprom) o->eepromctl = 1;
 		ast_mutex_unlock(&o->eepromlock);
 		mixer_write(o);
-		setformat(o,O_RDWR);		// KB4FXC 2014-08-24
                 o->hasusb = 1;
 		while((!o->stophid) && o->hasusb)
 		{
@@ -1692,11 +1767,16 @@ static void *hidthread(void *arg)
 			buf[o->hid_gpio_ctl_loc] = o->hid_gpio_ctl;
 			hid_get_inputs(usb_handle,buf);
 			keyed = !(buf[o->hid_io_cor_loc] & o->hid_io_cor);
+			if(o->israspi)keyed = gpio_getcor(o);	
+//			if(o->debuglevel) ast_log(LOG_NOTICE,"chan_usbradio() hidthread: update rxhidsq = %d\n",keyed);
+			if ((keyed != o->rxgpiosq) && o->israspi && o->corpin) o->rxgpiosq=keyed;
+			
 			if (keyed != o->rxhidsq)
 			{
 				if(o->debuglevel)printf("chan_simpleusb() hidthread: update rxhidsq = %d\n",keyed);
 				o->rxhidsq = keyed;
 			}
+			if(o->israspi && o->ctcsspin) o->rxgpioctcss = gpio_getctcss(o);
 			ctcssed = !(buf[o->hid_io_ctcss_loc] & 
 				o->hid_io_ctcss);
 			if (ctcssed != o->rxhidctcss)
@@ -1710,18 +1790,24 @@ static void *hidthread(void *arg)
 			txreq = txreq || o->txkeyed || o->txtestkey || o->txclikey || o->echoing;
 			if (txreq && (!o->lasttx))
 			{
+				if(o->israspi && !o->invertptt) gpio_pttkey(o);
+				if(o->israspi && o->invertptt) gpio_pttunkey(o);
 				buf[o->hid_gpio_loc] = o->hid_io_ptt;
 				if (o->invertptt) buf[o->hid_gpio_loc] = 0;
 				buf[o->hid_gpio_ctl_loc] = o->hid_gpio_ctl;
 				hid_set_outputs(usb_handle,buf);
+
 				if(o->debuglevel)printf("chan_simpleusb() hidthread: update PTT = %d\n",txreq);
 			}
 			else if ((!txreq) && o->lasttx)
 			{
+				if(o->israspi && o->invertptt) gpio_pttkey(o);
+				if(o->israspi && !o->invertptt) gpio_pttunkey(o);
 				buf[o->hid_gpio_loc] = 0;
 				if (o->invertptt) buf[o->hid_gpio_loc] = o->hid_io_ptt;
 				buf[o->hid_gpio_ctl_loc] = o->hid_gpio_ctl;
 				hid_set_outputs(usb_handle,buf);
+
 				if(o->debuglevel)printf("chan_simpleusb() hidthread: update PTT = %d\n",txreq);
 			}
 			lasttxtmp = o->lasttx;
@@ -2246,7 +2332,7 @@ static int simpleusb_text(struct ast_channel *c, const char *text)
 {
 	struct chan_simpleusb_pvt *o = c->tech_pvt;
 	char *cmd;
-	int cnt,i,j,audio_samples,divcnt,divdiv,audio_ptr,baud;
+	int cnt,i,j,tone,audio_samples,divcnt,divdiv,audio_ptr,baud;
 	struct pocsag_batch *batch,*b;
 	short *audio;
 	char audio1[AST_FRIENDLY_OFFSET + (FRAME_SIZE * sizeof(short))];
@@ -2325,6 +2411,7 @@ static int simpleusb_text(struct ast_channel *c, const char *text)
 		switch(text[j])
 		{
 		    case 'T': /* Tone only */
+			tone = 2;
 			if (option_verbose > 2) 
 				ast_verbose(VERBOSE_PREFIX_3 "POCSAG page (%d baud, capcode=%d) TONE ONLY\n",baud,i);
 			batch = make_pocsag_batch(i, NULL, 0, TONE, 0);
@@ -2709,28 +2796,24 @@ static struct ast_frame *simpleusb_read(struct ast_channel *c)
 					}
 					for(i = 0; i < FRAME_SIZE; i++)
 					{
-						short s,v;
+						short v;
 
-						if (o->preemphasis)
-							s = preemph(sp[i],&o->prestate);
-						else
-							s = sp[i];
-						v = lpass(s,o->flpt);
+						v = lpass(sp[i],o->flpt);
 						*sp1++ = (doleft) ? v : 0;
 						*sp1++ = (doright) ? v : 0;
-						v = lpass(s,o->flpt);
+						v = lpass(sp[i],o->flpt);
 						*sp1++ = (doleft) ? v : 0;
 						*sp1++ = (doright) ? v : 0;
-						v = lpass(s,o->flpt);
+						v = lpass(sp[i],o->flpt);
 						*sp1++ = (doleft) ? v : 0;
 						*sp1++ = (doright) ? v : 0;
-						v = lpass(s,o->flpt);
+						v = lpass(sp[i],o->flpt);
 						*sp1++ = (doleft) ? v : 0;
 						*sp1++ = (doright) ? v : 0;
-						v = lpass(s,o->flpt);
+						v = lpass(sp[i],o->flpt);
 						*sp1++ = (doleft) ? v : 0;
 						*sp1++ = (doright) ? v : 0;
-						v = lpass(s,o->flpt);
+						v = lpass(sp[i],o->flpt);
 						*sp1++ = (doleft) ? v : 0;
 						*sp1++ = (doright) ? v : 0;
 					}				
@@ -2782,6 +2865,9 @@ static struct ast_frame *simpleusb_read(struct ast_channel *c)
 	else if ((o->rxcdtype == CD_HID_INVERT) && o->rxhidsq) cd = 0;
 	else if ((o->rxcdtype == CD_PP) && (!o->rxppsq)) cd = 0;
 	else if ((o->rxcdtype == CD_PP_INVERT) && o->rxppsq) cd = 0;
+	else if ((o->rxcdtype == CD_RPI) && (!o->rxgpiosq)) cd = 0;
+	else if ((o->rxcdtype == CD_RPI_INVERT) && o->rxppsq) cd = 0;
+	
 
 	/* apply cd turn-on delay, if one specified */
 	if (o->rxondelay && cd && (o->rxoncnt++ < o->rxondelay)) cd = 0;
@@ -2792,6 +2878,8 @@ static struct ast_frame *simpleusb_read(struct ast_channel *c)
 	else if ((o->rxsdtype == SD_HID_INVERT) && o->rxhidctcss) sd = 0;
 	else if ((o->rxsdtype == SD_PP) && (!o->rxppctcss)) sd = 0;
 	else if ((o->rxsdtype == SD_PP_INVERT) && o->rxppctcss) sd = 0;
+	else if ((o->rxsdtype == SD_RPI) && (!o->rxgpioctcss)) cd = 0;
+	else if ((o->rxsdtype == SD_RPI_INVERT) && o->rxgpioctcss) cd = 0;
 
 	if (o->rxctcssoverride) sd = 1;
 
@@ -2803,8 +2891,6 @@ static struct ast_frame *simpleusb_read(struct ast_channel *c)
 		// printf("AST_CONTROL_RADIO_UNKEY\n");
 		wf.subclass = AST_CONTROL_RADIO_UNKEY;
 		ast_queue_frame(o->owner, &wf);
-		if (o->duplex3)
-			setamixer(o->devicenum,MIXER_PARAM_MIC_PLAYBACK_SW,0,0);
 	}
 	else if ((!o->lastrx) && (o->rxkeyed))
 	{
@@ -2812,8 +2898,6 @@ static struct ast_frame *simpleusb_read(struct ast_channel *c)
 		//printf("AST_CONTROL_RADIO_KEY\n");
 		wf.subclass = AST_CONTROL_RADIO_KEY;
 		ast_queue_frame(o->owner, &wf);
-		if (o->duplex3)
-			setamixer(o->devicenum,MIXER_PARAM_MIC_PLAYBACK_SW,1,0);
 	}
 
 	sp = (short *)o->simpleusb_read_buf;
@@ -3226,6 +3310,7 @@ static void tune_rxdisplay(int fd, struct chan_simpleusb_pvt *o)
 		ast_cli(fd,"|%s|\r",str);
 	}
 	o->b.measure_enabled = 0;
+	ast_cli(fd,"\n");
 	option_verbose = wasverbose;
 }
 
@@ -3791,6 +3876,12 @@ static void store_rxcdtype(struct chan_simpleusb_pvt *o, char *s)
 	else if (!strcasecmp(s,"ppinvert")){
 		o->rxcdtype = CD_PP_INVERT;
 	}	
+	else if (!strcasecmp(s,"rpi")){
+		o->rxcdtype = CD_RPI;
+	}	
+	else if (!strcasecmp(s,"rpiinvert")){
+		o->rxcdtype = CD_RPI_INVERT;
+	}	
 	else {
 		ast_log(LOG_WARNING,"Unrecognized rxcdtype parameter: %s\n",s);
 	}
@@ -3815,6 +3906,12 @@ static void store_rxsdtype(struct chan_simpleusb_pvt *o, char *s)
 	}	
 	else if (!strcasecmp(s,"ppinvert")) {
 		o->rxsdtype = SD_PP_INVERT;
+	}	
+	else if (!strcasecmp(s,"rpi")) {
+		o->rxsdtype = SD_RPI;
+	}	
+	else if (!strcasecmp(s,"rpiinvert")) {
+		o->rxsdtype = SD_RPI_INVERT;
 	}	
 	else {
 		ast_log(LOG_WARNING,"Unrecognized rxsdtype parameter: %s\n",s);
@@ -3881,19 +3978,10 @@ static void mixer_write(struct chan_simpleusb_pvt *o)
 	int x;
 	float f,f1;
 
-	if (o->duplex3)
-	{
-		if (o->duplex3 > o->micplaymax)
-			o->duplex3 = o->micplaymax;
-		setamixer(o->devicenum,MIXER_PARAM_MIC_PLAYBACK_VOL,o->duplex3,0);
-	}
-	else
-	{
-		setamixer(o->devicenum,MIXER_PARAM_MIC_PLAYBACK_VOL,0,0);
-	}
 	setamixer(o->devicenum,MIXER_PARAM_MIC_PLAYBACK_SW,0,0);
-	setamixer(o->devicenum,(o->newname) ? MIXER_PARAM_SPKR_PLAYBACK_SW_NEW : MIXER_PARAM_SPKR_PLAYBACK_SW,1,0);
-	setamixer(o->devicenum,(o->newname) ? MIXER_PARAM_SPKR_PLAYBACK_VOL_NEW : MIXER_PARAM_SPKR_PLAYBACK_VOL,
+	setamixer(o->devicenum,MIXER_PARAM_MIC_PLAYBACK_VOL,0,0);
+	setamixer(o->devicenum,MIXER_PARAM_SPKR_PLAYBACK_SW,1,0);
+	setamixer(o->devicenum,MIXER_PARAM_SPKR_PLAYBACK_VOL,
 		make_spkr_playback_value(o,o->txmixaset),
 		make_spkr_playback_value(o,o->txmixbset));
 	x =  o->rxmixerset * o->micmax / 1000;
@@ -3907,6 +3995,47 @@ static void mixer_write(struct chan_simpleusb_pvt *o)
 /*
 	adjust dsp multiplier to add resolution to tx level adjustment
 */
+
+static int gpio_getcor(struct chan_simpleusb_pvt *o)
+{
+ 
+	int rpicor;
+
+	rpicor=GPIO_READ(o->corpin);
+	if (!rpicor) return (0);
+	else 
+//	usleep(1000000);
+	return (1);
+
+}
+
+static int gpio_getctcss(struct chan_simpleusb_pvt *o)
+{
+	int rpictcss;
+
+	rpictcss=GPIO_READ(o->ctcsspin);
+	if (!rpictcss) return (0);
+	else return (1);
+}
+
+static int gpio_pttkey(struct chan_simpleusb_pvt *o)
+{
+
+	GPIO_SET = 1 << o->pttpin;
+
+	return 0;
+}
+
+static int gpio_pttunkey(struct chan_simpleusb_pvt *o)
+{
+
+
+	GPIO_CLR = 1 << o->pttpin;
+	return 0;
+}
+
+
+
 
 
 /*
@@ -3969,13 +4098,16 @@ static struct chan_simpleusb_pvt *store_config(struct ast_config *cfg, char *ctg
  			M_BOOL("rxboost",o->rxboostset)
 			M_UINT("hdwtype",o->hdwtype)
 			M_UINT("eeprom",o->wanteeprom)
+			M_BOOL("piversion2",o->piversion2)
+			M_BOOL("israspi",o->israspi)
+			M_UINT("pttpin", o->pttpin)
+			M_UINT("ctcsspin", o->ctcsspin)
+			M_UINT("corpin", o->corpin)
 			M_UINT("duplex",o->radioduplex)
 			M_UINT("rxondelay",o->rxondelay)
 			M_F("pager",store_pager(o,(char *)v->value))
  			M_BOOL("plfilter",o->plfilter)
  			M_BOOL("deemphasis",o->deemphasis)
- 			M_BOOL("preemphasis",o->preemphasis)
- 			M_UINT("duplex3",o->duplex3)
 			M_END(;
 			);
 			for(i = 0; i < 32; i++)
@@ -4060,6 +4192,7 @@ static struct chan_simpleusb_pvt *store_config(struct ast_config *cfg, char *ctg
 #endif
 	}
 	hidhdwconfig(o);
+	if (o->israspi) gpio_init(o);
 
 #ifndef	NEW_ASTERISK
 	if (pipe(o->sndcmd) != 0) {
@@ -4297,8 +4430,17 @@ static int load_module(void)
 
 	return AST_MODULE_LOAD_SUCCESS;
 }
-/*
-*/
+
+static void gpio_uninit(struct chan_simpleusb_pvt *o) {
+ 
+    munmap(o->gpio_map, BLOCK_SIZE);
+    close(o->mem_fd);
+}
+
+
+
+
+
 static int unload_module(void)
 {
 	struct chan_simpleusb_pvt *o;
@@ -4315,6 +4457,7 @@ static int unload_module(void)
 		if (frxcapcooked) { fclose(frxcapraw); frxcapcooked = NULL; }
 		if (ftxcapraw) { fclose(ftxcapraw); ftxcapraw = NULL; }
 		#endif
+		gpio_uninit(o);
 
 		close(o->sounddev);
 #ifndef	NEW_ASTERISK

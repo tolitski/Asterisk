@@ -136,3 +136,5 @@ chan_simpleusb.so: LIBS+=-lusb -lasound
 
 chan_beagle.so: LIBS+=-lasound
 
+chan_rpiradio.so: LIBS+=-lasound
+
