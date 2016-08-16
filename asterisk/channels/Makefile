@@ -138,3 +138,5 @@ chan_beagle.so: LIBS+=-lasound
 
 chan_rpiradio.so: LIBS+=-lasound
 
+chan_pi.so: LIBS+=-lasound
+
