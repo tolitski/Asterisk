@@ -136,7 +136,12 @@ chan_simpleusb.so: LIBS+=-lusb -lasound
 
 chan_beagle.so: LIBS+=-lasound
 
+chan_rpiradio.c: busy.h ringtone.h
+
 chan_rpiradio.so: LIBS+=-lasound
 
 chan_pi.so: LIBS+=-lasound
 
+chan_alsaradio.so: LIBS+=-lasound
+
+chan_alsaradio.c: busy.h ringtone.h 
