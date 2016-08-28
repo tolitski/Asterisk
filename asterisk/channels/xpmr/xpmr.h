@@ -636,6 +636,10 @@ typedef struct	t_pmr_chan
 
 	char radioDuplex;
 	char rxNoiseFilType;
+    int	 rxlpf;
+    int	 rxhpf;
+    int	 txlpf;
+    int	 txhpf;
 
 	char    *pStr;
 
@@ -926,9 +930,6 @@ typedef struct	t_pmr_chan
 void 		strace(i16 point, t_sdbg *sdbg, i16 index, i16 value);
 void 		strace2(t_sdbg *sdbg);
 
-#ifndef	XPMR_VOTER
-static i16	TxTestTone(t_pmr_chan *pChan, i16 function);
-#endif
 t_pmr_chan	*createPmrChannel(t_pmr_chan *tChan, i16 numSamples);
 t_pmr_sps 	*createPmrSps(t_pmr_chan *pChan);
 i16			destroyPmrChannel(t_pmr_chan *pChan);
@@ -960,6 +961,9 @@ void 		dedrift_write	(t_pmr_chan *pChan, i16 *src);
 void		ppspiout	(u32 spidata);
 void		progdtx		(t_pmr_chan *pChan);
 void		ppbinout	(u8 chan);
+
+i16		TxTestTone(t_pmr_chan *pChan, i16 function);
+
 
 #if XPMR_PPTP == 1
 void		pptp_init 		(void);
