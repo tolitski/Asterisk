@@ -24,6 +24,7 @@
  * A license has been granted to Digium (via disclaimer) for the use of
  * this code.
  *
+ * 20160829      inad            added rxlpf rxhpf txlpf txhpf
  * 20090725 2039 sph@xelatec.com improved rxfrontend and squelch
   */
 

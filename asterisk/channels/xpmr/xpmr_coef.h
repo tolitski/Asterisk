@@ -26,6 +26,7 @@
  *
  * Some filter coeficients via 'WinFilter' http://www.winfilter.20m.com.
  *
+ * 20160829      inad            added rxlpf rxhpf txlpf txhpf
  */
 
 /*! \file
