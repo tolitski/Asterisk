@@ -23,8 +23,12 @@
  *
  * A license has been granted to Digium (via disclaimer) for the use of
  * this code.
+
+ * A license has been granted to Digium (via disclaimer) for the use of
+ * this code.
  *
- * 20160829      inad            added rxlpf rxhpf txlpf txhpf
+ * 20160829	inad	added rxlpf rxhpf txlpf txhpf
+ * 20161024	inad	fixed set the number of coefficients
  * 20090725 2039 sph@xelatec.com improved rxfrontend and squelch
   */
 
@@ -2090,10 +2094,10 @@ t_pmr_chan	*createPmrChannel(t_pmr_chan *tChan, i16 numSamples)
 	pSps->decimator=pSps->decimate=6;
 	pSps->interpolate=pSps->interpolate=1;
 	pSps->nSamples=pChan->nSamplesRx;
-	pSps->ncoef=taps_fir_bpf_noise_1;
+	pSps->ncoef=fir_rxlpf[pChan->rxlpf].taps;
 	pSps->size_coef=2;
 	pSps->coef=(void*)fir_rxlpf[pChan->rxlpf].coefs;
-	pSps->nx=taps_fir_bpf_noise_1;
+	pSps->nx=fir_rxlpf[pChan->rxlpf].taps;
 	pSps->size_x=2;
 	pSps->x=(void*)(calloc(pSps->nx,pSps->size_coef));
 	pSps->calcAdjust=(fir_rxlpf[pChan->rxlpf].gain*256)/0x0100;
